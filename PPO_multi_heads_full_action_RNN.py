@@ -381,6 +381,7 @@ def main():
             nn.init.zeros_(layer.bias_ih_l0)
             nn.init.zeros_(layer.bias_hh_l0)
         return layer
+        
     model = pfrl.nn.RecurrentSequential(
             lecun_init(nn.Conv2d(4, 32, kernel_size=8, stride=4)),
             nn.LayerNorm([32, 31, 31]),
@@ -394,9 +395,7 @@ def main():
             nn.Flatten(),
             lecun_init(nn.Linear(4608, 256)),
             nn.ReLU(),
-            nn.ReLU(),
             lecun_init(nn.GRU(num_layers=1, input_size=256, hidden_size=256)),
-            nn.ReLU(),
             pfrl.nn.Branched(
                 pfrl.nn.Branched(
                     # Policy: Continuous actions
@@ -405,7 +404,7 @@ def main():
                         pfrl.policies.GaussianHeadWithStateIndependentCovariance(
                             action_size=continous_action_size,
                             var_type="diagonal",
-                            var_func=lambda x: torch.exp(2 * x),  # Parameterize log std
+                            var_func=lambda x: F.softplus(x) + 1e-6,  # Parameterize log std
                             var_param_init=0,  # log std = 0 => std = 1
                         )
                     ),
