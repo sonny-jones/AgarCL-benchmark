@@ -9,7 +9,8 @@ import os
 
 import numpy as np
 import torch
-from torch import nn
+from torh
+import torch.nn.functional as F
 import gymnasium as gym
 
 import pfrl
