@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from torch import nn
 import gymnasium as gym
+from collections import deque
 
 import pfrl
 from pfrl import agents, experiments, explorers
@@ -54,6 +55,92 @@ class ObservationWrapper(gym.ObservationWrapper):
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         return obs[0].transpose(2, 0, 1), info
+    
+class StableScaleTracker:
+    def __init__(self, window_size=100):
+        self.history = deque(maxlen=window_size)
+        self.current_max_bound = 1.0
+
+    def track_and_get_max(self, distance_array):
+        distance_array = np.asarray(distance_array, dtype=np.float32)
+        if distance_array.size > 0:
+            self.history.append(float(np.max(distance_array)))
+
+        if len(self.history) > 0:
+            self.current_max_bound = float(max(self.history))
+
+        return max(self.current_max_bound, 1e-8)
+
+class ObservationWrapperGoBigger(gym.ObservationWrapper):
+    def __init__(self, env, pellet_num=20, virus_num=5, clone_num=5):
+        super().__init__(env)
+        self.pellet_num = pellet_num
+        self.virus_num = virus_num
+        self.clone_num = clone_num
+        self.tracker = StableScaleTracker()
+
+        self.total_features = (self.pellet_num + self.virus_num + self.clone_num) * 2
+        self.observation_space = gym.spaces.Box(
+            low=-5.0,
+            high=5.0,
+            shape=(self.total_features,),
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _sorted_distances(infos, limit):
+        if not infos:
+            return np.array([], dtype=np.float32)
+
+        positions = np.asarray(
+            [(entity.get_position_x(), entity.get_position_y()) for entity in infos],
+            dtype=np.float32,
+        )
+        return np.sort(np.linalg.norm(positions, axis=1))[:limit].astype(np.float32, copy=False)
+
+    @staticmethod
+    def _pad_and_interleave(distances, target_len, max_norm):
+        distances = np.asarray(distances, dtype=np.float32)
+        flags = np.ones(distances.size, dtype=np.float32)
+
+        pad = max(0, target_len - distances.size)
+        distances = np.pad(distances, (0, pad), mode='constant', constant_values=0.0)
+        flags = np.pad(flags, (0, pad), mode='constant', constant_values=0.0)
+
+        max_norm = max(float(max_norm), 1e-8)
+        combined = np.empty(target_len * 2, dtype=np.float32)
+        combined[0::2] = distances / max_norm
+        combined[1::2] = flags
+        return combined
+
+    def observation(self, observation):
+        player_states = observation['player_states'].get_all_player_states()
+        moveable_player = sorted(player_states.keys())[0]
+        player_obs = player_states[moveable_player]
+
+        pellet_distances = self._sorted_distances(player_obs.get_food_infos(), self.pellet_num)
+        virus_distances = self._sorted_distances(player_obs.get_virus_infos(), self.virus_num)
+        clone_distances = self._sorted_distances(
+            [clone for clone in player_obs.get_clone_infos() if clone.owner != moveable_player],
+            self.clone_num,
+        )
+
+        max_norm = self.tracker.track_and_get_max(
+            np.hstack([pellet_distances, virus_distances, clone_distances])
+        )
+
+        obs = np.hstack(
+            [
+                self._pad_and_interleave(pellet_distances, self.pellet_num, max_norm),
+                self._pad_and_interleave(virus_distances, self.virus_num, max_norm),
+                self._pad_and_interleave(clone_distances, self.clone_num, max_norm),
+            ]
+        )
+        return np.clip(obs, -5.0, 5.0).astype(np.float32, copy=False)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self.observation(obs), info
 
 class NormalizeReward(gym.RewardWrapper):
     #MIN-MAX Normalization
@@ -190,6 +277,11 @@ def main():
     parser.add_argument("--episode-idx", type=int, default=0)
     parser.add_argument("--mini_game", type=str, default="agario-screen-v0", help="Mini-game to play")
     parser.add_argument("--env_type", type=int, default=0, help="0 for AgarCL Episodic, 1 for AgarCL Continuing")
+
+    parser.add_argument("--pellet_obs", type=int, default=20, help="The number of pellets for distance observations")
+    parser.add_argument("--virus_obs", type=int, default=5, help="The number of viruses for distance observations")
+    parser.add_argument("--clone_obs", type=int, default=5, help="The number of clones for distance observations")
+
     args = parser.parse_args()
 
     logging.basicConfig(level=args.log_level)
@@ -250,7 +342,7 @@ def main():
             env.load_env_state(args.load_env)
             
         env = MultiActionWrapper(env)
-        env = ObservationWrapper(env)
+        env = ObservationWrapperGoBigger(env, args.pellet_obs, args.virus_obs) if args.env == 'agario-grid-v0' else ObservationWrapper(env)
         # env = gym.wrappers.ClipAction(env)
         # env = gym.wrappers.flatten_observation.FlattenObservation(env)
         # Cast observations to float32 because our model uses float32
@@ -291,8 +383,13 @@ def main():
     # assert isinstance(action_space, gym.spaces.Box)
 
     # Normalize observations based on their empirical mean and variance
-    obs_shape = (obs_space.shape[3], obs_space.shape[1], obs_space.shape[2])
-    
+    if args.env == 'agario-screen-v0':
+        obs_shape = (obs_space.shape[3], obs_space.shape[1], obs_space.shape[2])
+        obs_normalizer = pfrl.nn.EmpiricalNormalization(
+            obs_shape, clip_threshold=5
+        )
+    else:
+        obs_normalizer = None
     
     class CustomCNN(nn.Module):
         def __init__(self, n_input_channels, n_output_channels, activation=nn.ReLU(), bias=0.1):
@@ -327,42 +424,69 @@ def main():
                 h = self.activation(layer(h))
             h_flat = h.view(h.size(0), -1)
             return self.activation(self.output(h_flat))
-        
-    obs_normalizer = pfrl.nn.EmpiricalNormalization(
-        obs_shape, clip_threshold=5
-    )
 
     obs_size = obs_space.low.size
     # action_size = action_space.low.size
     continous_action_size = 2
     discrete_action_size = 3
+    if args.env == 'agario-grid-v0':
+        input_size = (args.pellet_obs + args.virus_obs + args.clone_obs) * 2
 
-    model = nn.Sequential(
-        CustomCNN(n_input_channels=4, n_output_channels=256),
-        nn.ReLU(),
-        pfrl.nn.Branched(
-        
+        model = nn.Sequential(
+            init_chainer_default(nn.Linear(input_size, 256)),
+            nn.LayerNorm(256),
+            nn.ReLU(),
             pfrl.nn.Branched(
-                
-                #Policy: Continous actions
-                nn.Sequential(
-                init_chainer_default(nn.Linear(256, continous_action_size)),
-                pfrl.policies.GaussianHeadWithStateIndependentCovariance(
-                        action_size=continous_action_size,
-                        var_type="diagonal",
-                        var_func=lambda x: torch.exp(2 * x),  # Parameterize log std
-                        var_param_init=0,  # log std = 0 => std = 1
-                    )
+            
+                pfrl.nn.Branched(
+                    
+                    #Policy: Continous actions
+                    nn.Sequential(
+                    init_chainer_default(nn.Linear(256, continous_action_size)),
+                    pfrl.policies.GaussianHeadWithStateIndependentCovariance(
+                            action_size=continous_action_size,
+                            var_type="diagonal",
+                            var_func=lambda x: torch.exp(2 * x),  # Parameterize log std
+                            var_param_init=0,  # log std = 0 => std = 1
+                        )
+                    ),
+                    #Policy: Discrete Actions
+                    nn.Sequential(
+                    init_chainer_default(nn.Linear(256,discrete_action_size)), 
+                    pfrl.policies.SoftmaxCategoricalHead(),
+                    ),
                 ),
-                #Policy: Discrete Actions
-                nn.Sequential(
-                init_chainer_default(nn.Linear(256,discrete_action_size)), 
-                pfrl.policies.SoftmaxCategoricalHead(),
-                ),
-            ),
-            init_chainer_default(nn.Linear(256, 1))
+                init_chainer_default(nn.Linear(256, 1))
+            )
         )
-    )
+
+    else:
+        model = nn.Sequential(
+            CustomCNN(n_input_channels=4, n_output_channels=256),
+            nn.ReLU(),
+            pfrl.nn.Branched(
+            
+                pfrl.nn.Branched(
+                    
+                    #Policy: Continous actions
+                    nn.Sequential(
+                    init_chainer_default(nn.Linear(256, continous_action_size)),
+                    pfrl.policies.GaussianHeadWithStateIndependentCovariance(
+                            action_size=continous_action_size,
+                            var_type="diagonal",
+                            var_func=lambda x: torch.exp(2 * x),  # Parameterize log std
+                            var_param_init=0,  # log std = 0 => std = 1
+                        )
+                    ),
+                    #Policy: Discrete Actions
+                    nn.Sequential(
+                    init_chainer_default(nn.Linear(256,discrete_action_size)), 
+                    pfrl.policies.SoftmaxCategoricalHead(),
+                    ),
+                ),
+                init_chainer_default(nn.Linear(256, 1))
+            )
+        )
 
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-7)
